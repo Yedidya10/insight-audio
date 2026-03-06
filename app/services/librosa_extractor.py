@@ -1,6 +1,12 @@
-"""Librosa audio feature extraction service."""
+"""Librosa audio feature extraction service.
+
+Tier 1 of the audio analysis pipeline — deterministic signal processing features
+extracted from audio waveforms. Covers tempo, key, spectral features, MFCCs,
+chroma, energy, and tonal analysis.
+"""
 
 import logging
+import time
 from pathlib import Path
 
 import librosa
@@ -19,14 +25,30 @@ MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 
 
 
 class LibrosaExtractor:
-    """Extracts audio features using librosa."""
+    """Extracts audio features using librosa.
+
+    Features extracted:
+    - Tempo (BPM) via beat tracking with confidence
+    - Key detection via Krumhansl-Schmuckler algorithm
+    - Spectral: centroid, bandwidth, rolloff, flatness
+    - MFCCs (13 coefficients) — means and variances
+    - Chroma features (12-bin pitch class profile)
+    - Tonnetz (6-dim tonal centroid features)
+    - RMS energy
+    - Zero crossing rate
+    - Onset strength
+    """
 
     def __init__(self, sample_rate: int = 22050) -> None:
         self.sample_rate = sample_rate
 
     async def extract(self, audio_path: Path) -> LibrosaFeatures:
-        """Extract all librosa features from an audio file."""
+        """Extract all librosa features from an audio file.
+
+        Target processing time: <30s per track.
+        """
         logger.info("Extracting librosa features from %s", audio_path)
+        start_time = time.monotonic()
 
         y, sr = librosa.load(str(audio_path), sr=self.sample_rate, mono=True)
         duration = librosa.get_duration(y=y, sr=sr)
@@ -36,6 +58,11 @@ class LibrosaExtractor:
         if isinstance(tempo, np.ndarray):
             tempo = float(tempo[0])
 
+        # BPM confidence from onset autocorrelation
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        tempo_ac = librosa.autocorrelate(onset_env, max_size=sr // 512 * 4)
+        bpm_confidence = float(np.max(tempo_ac[1:]) / (tempo_ac[0] + 1e-10)) if len(tempo_ac) > 1 else 0.0
+
         # Key detection
         key, key_confidence, mode = self._detect_key(y, sr)
 
@@ -43,14 +70,20 @@ class LibrosaExtractor:
         spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
         spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+        spectral_flatness = librosa.feature.spectral_flatness(y=y)[0]
 
-        # MFCCs
+        # MFCCs (13 coefficients)
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         mfcc_means = np.mean(mfccs, axis=1)
+        mfcc_vars = np.var(mfccs, axis=1)
 
         # Chroma
         chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
         chroma_means = np.mean(chroma, axis=1)
+
+        # Tonnetz (tonal centroid features)
+        tonnetz = librosa.feature.tonnetz(y=y, sr=sr)
+        tonnetz_means = np.mean(tonnetz, axis=1)
 
         # Energy
         rms = librosa.feature.rms(y=y)[0]
@@ -58,12 +91,13 @@ class LibrosaExtractor:
         # Zero crossing rate
         zcr = librosa.feature.zero_crossing_rate(y=y)[0]
 
-        # Onset strength
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        elapsed = time.monotonic() - start_time
+        logger.info("Librosa extraction completed in %.1fs for %s", elapsed, audio_path.name)
 
         return LibrosaFeatures(
             tempo=float(tempo),
             beat_count=len(beats),
+            bpm_confidence=float(bpm_confidence),
             key=key,
             key_confidence=float(key_confidence),
             mode=mode,
@@ -71,8 +105,11 @@ class LibrosaExtractor:
             spectral_centroid_std=float(np.std(spectral_centroid)),
             spectral_bandwidth_mean=float(np.mean(spectral_bandwidth)),
             spectral_rolloff_mean=float(np.mean(spectral_rolloff)),
+            spectral_flatness_mean=float(np.mean(spectral_flatness)),
             mfccs=[float(x) for x in mfcc_means],
+            mfcc_vars=[float(x) for x in mfcc_vars],
             chroma=[float(x) for x in chroma_means],
+            tonnetz=[float(x) for x in tonnetz_means],
             rms_energy_mean=float(np.mean(rms)),
             rms_energy_std=float(np.std(rms)),
             zero_crossing_rate_mean=float(np.mean(zcr)),
