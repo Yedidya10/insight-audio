@@ -1,6 +1,12 @@
-"""PANNs Cnn14 audio classification service."""
+"""PANNs Cnn14 audio classification service.
+
+Tier 2 of the audio analysis pipeline — AudioSet-based audio tagging
+that classifies tracks into 527 classes covering genres, moods, instruments,
+and sound events. Also extracts 2048-dim embeddings for similarity search.
+"""
 
 import logging
+import time
 from pathlib import Path
 
 import librosa
@@ -36,17 +42,32 @@ INSTRUMENT_TAGS = {
     191: "Synthesizer", 192: "Singing",
 }
 
+VOCAL_TAGS = {
+    192: "Singing",
+    193: "Male singing",
+    194: "Female singing",
+    0: "Speech",
+    132: "Vocal music",
+    133: "A capella",
+}
+
+# All tags combined for reverse lookup
+ALL_TAGS = {**GENRE_TAGS, **MOOD_TAGS, **INSTRUMENT_TAGS, **VOCAL_TAGS}
+
+# PANNs sample rate
+PANNS_SAMPLE_RATE = 32000
+
 
 class PannsClassifier:
-    """PANNs Cnn14 audio classification."""
+    """PANNs Cnn14 audio classification with GPU support and embedding extraction."""
 
     def __init__(self, model_dir: str = "./models") -> None:
         self.model_dir = Path(model_dir)
-        self._model: torch.nn.Module | None = None
+        self._model: object | None = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _load_model(self) -> None:
-        """Load PANNs model (lazy loading)."""
+        """Load PANNs model (lazy loading with warm-up)."""
         if self._model is not None:
             return
 
@@ -54,26 +75,37 @@ class PannsClassifier:
             from panns_inference import AudioTagging
 
             self._model = AudioTagging(
-                checkpoint_path=None,  # Will download automatically
+                checkpoint_path=None,  # Downloads ~300MB checkpoint automatically
                 device=str(self._device),
             )
-            logger.info("PANNs model loaded on %s", self._device)
+            logger.info("PANNs Cnn14 loaded on %s", self._device)
+
+            # Warm up model with a short dummy input
+            dummy = np.zeros((1, PANNS_SAMPLE_RATE), dtype=np.float32)
+            self._model.inference(dummy)
+            logger.info("PANNs model warmed up")
+
         except Exception:
             logger.exception("Failed to load PANNs model")
             raise
 
-    async def classify(self, audio_path: Path, sample_rate: int = 32000) -> PannsFeatures:
-        """Classify audio using PANNs Cnn14."""
+    async def classify(self, audio_path: Path) -> PannsFeatures:
+        """Classify audio using PANNs Cnn14.
+
+        Extracts 527 AudioSet tag probabilities, then maps to genres,
+        moods, instruments, and vocal presence.
+        """
         self._load_model()
 
         logger.info("Classifying audio with PANNs: %s", audio_path)
+        start_time = time.monotonic()
 
         # Load and resample audio for PANNs (32kHz mono)
-        y, _ = librosa.load(str(audio_path), sr=sample_rate, mono=True)
+        y, _ = librosa.load(str(audio_path), sr=PANNS_SAMPLE_RATE, mono=True)
         audio_input = y[np.newaxis, :]
 
-        # Run inference
-        clipwise_output, _ = self._model.inference(audio_input)  # type: ignore[union-attr]
+        # Run inference - returns (clipwise_output, embedding)
+        clipwise_output, embedding = self._model.inference(audio_input)  # type: ignore[union-attr]
         probs = clipwise_output[0]
 
         # Extract music-relevant tags
@@ -82,30 +114,56 @@ class PannsClassifier:
         moods = self._extract_category(probs, MOOD_TAGS, n=3)
         instruments = self._extract_category(probs, INSTRUMENT_TAGS, n=10)
 
+        # Vocal detection
+        singing_prob = float(probs[192]) if len(probs) > 192 else 0.0
+        male_singing = float(probs[193]) if len(probs) > 193 else 0.0
+        female_singing = float(probs[194]) if len(probs) > 194 else 0.0
+
+        elapsed = time.monotonic() - start_time
+        logger.info("PANNs classification completed in %.1fs on %s", elapsed, self._device)
+
         return PannsFeatures(
             top_tags=top_tags,
             genres=genres,
             moods=moods,
             instruments=instruments,
+            is_vocal=singing_prob,
+            male_singing=male_singing,
+            female_singing=female_singing,
         )
 
+    async def get_embedding(self, audio_path: Path) -> list[float]:
+        """Extract 2048-dim embedding from PANNs Cnn14 penultimate layer.
+
+        These embeddings capture the general audio characteristics and can
+        be used for track-to-track similarity search.
+        """
+        self._load_model()
+
+        y, _ = librosa.load(str(audio_path), sr=PANNS_SAMPLE_RATE, mono=True)
+        audio_input = y[np.newaxis, :]
+
+        _, embedding = self._model.inference(audio_input)  # type: ignore[union-attr]
+        return embedding[0].tolist()
+
     def _extract_top_tags(self, probs: np.ndarray, n: int = 20) -> list[PannsResult]:
-        """Extract top N tags across all AudioSet classes."""
+        """Extract top N tags across all 527 AudioSet classes."""
         top_indices = np.argsort(probs)[::-1][:n]
-        results = []
-        for idx in top_indices:
-            # Map index to AudioSet label name (simplified)
-            all_tags = {**GENRE_TAGS, **MOOD_TAGS, **INSTRUMENT_TAGS}
-            tag_name = all_tags.get(int(idx), f"class_{idx}")
-            results.append(PannsResult(tag=tag_name, probability=float(probs[idx])))
-        return results
+        return [
+            PannsResult(
+                tag=ALL_TAGS.get(int(idx), f"class_{idx}"),
+                probability=float(probs[idx]),
+            )
+            for idx in top_indices
+        ]
 
     def _extract_category(
         self, probs: np.ndarray, tag_map: dict[int, str], n: int = 5
     ) -> list[PannsResult]:
         """Extract top tags from a specific category."""
-        results = []
-        for idx, name in tag_map.items():
-            results.append(PannsResult(tag=name, probability=float(probs[idx])))
+        results = [
+            PannsResult(tag=name, probability=float(probs[idx]))
+            for idx, name in tag_map.items()
+        ]
         results.sort(key=lambda r: r.probability, reverse=True)
         return results[:n]
